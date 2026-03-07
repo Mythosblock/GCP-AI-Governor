@@ -1,14 +1,15 @@
-name: test
+name: Run Tests
 
 on:
   push:
-    branches: [main, feature/**]
+    paths:
+      - "**/*.py"
+      - "requirements.txt"
+      - ".github/workflows/test.yml"
   pull_request:
-    branches: [main]
-  workflow_dispatch:
 
 jobs:
-  local-governor-validation:
+  tests:
     runs-on: ubuntu-latest
 
     steps:
@@ -18,23 +19,14 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: '3.11'
-
-      - name: Create virtual environment
-        run: python3 -m venv .venv
+          python-version: "3.11"
 
       - name: Install dependencies
         run: |
-          .venv/bin/python3 -m pip install --upgrade pip
-          .venv/bin/pip install -r requirements.txt
+          pip install --upgrade pip
+          pip install -r requirements.txt
 
-      - name: Run smoke test
+      - name: Run unit tests
         run: |
-          chmod +x scripts/smoke_test.sh
-          bash scripts/smoke_test.sh
+          pytest -q
 
-      - name: Show server log on failure
-        if: failure()
-        run: |
-          echo "=== smoke_test_server.log ==="
-          cat smoke_test_server.log || true
