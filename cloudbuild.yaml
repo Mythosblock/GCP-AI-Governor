@@ -1,0 +1,16 @@
+steps:
+  # Step 1: Deploy to Cloud Run using Google Cloud Buildpacks
+  - name: 'gcr.io/google.com/cloudsdktool/cloud-sdk'
+    entrypoint: gcloud
+    args:
+      - 'run'
+      - 'deploy'
+      - 'gcp-ai-governor'
+      - '--source=.'
+      - '--region=us-central1'
+      - '--service-account=daemonic-core-sa@numeric-axe-zll0l.iam.gserviceaccount.com'
+      - '--no-allow-unauthenticated'
+      - '--set-env-vars=LIVE_MODE=false,MAX_ITERATIONS=8,GOOGLE_CLOUD_PROJECT=numeric-axe-zll0l,REGION=us-central1'
+
+options:
+  logging: CLOUD_LOGGING_ONLY
