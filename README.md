@@ -1,36 +1,32 @@
-# gcp-ai-governor
+# GCP-AI-Governor
 
-Local simulation environment for an AI cloud governance agent.
+An AI-driven cloud governance agent for Google Cloud infrastructure.
 
-## Verified control loop target
+GCP-AI-Governor is designed to monitor infrastructure-relevant events, evaluate policy posture, and trigger safe remediation decisions through a controlled governance loop. The current release validates that loop locally through deterministic simulation. The target architecture extends this into a cloud-native control surface using Cloud Audit Logs, Eventarc, Cloud Run, Vertex AI reasoning, and auditable tool execution.
 
-event -> evaluation -> decision -> simulated remediation
+## Why this exists
 
-## Project structure
+Cloud IAM drift, unsafe privilege grants, and delayed remediation create unnecessary blast radius across modern cloud environments. GCP-AI-Governor is being built as a governance-grade enforcement layer that starts with deterministic local policy validation and evolves toward cloud-native autonomous remediation with explicit guardrails, dry-run defaults, and auditable reasoning.
 
-- daemon/main.py
-- daemon/policies/policy_engine.py
-- daemon/tools/actions.py
-- daemon/simulator/simulate_event.py
+## Current validated control loop
 
-## Local run
+The current local system proves:
 
-Activate the environment:
+event -> policy evaluation -> decision -> simulated remediation
 
-source ~/gcp-ai-governor/.venv/bin/activate
+Validated decisions:
+- `roles/owner` -> `revoke`
+- `roles/viewer` -> `allow`
+- `roles/iam.serviceAccountAdmin` -> `revoke`
+- `heartbeat` -> `ignore`
 
-Start the agent:
+## Current architecture
 
-python3 ~/gcp-ai-governor/daemon/main.py
-
-Run the simulator in a second terminal:
-
-python3 ~/gcp-ai-governor/daemon/simulator/simulate_event.py
-
-## License
-
-This project is licensed under the **GNU Affero General Public License v3.0 (AGPL-3.0)**.
-
-If you run a modified version of this software as a network service,
-you must make the source code of your modifications available under
-the same license.
+```mermaid
+flowchart TD
+    A[Developer / Admin] -->|Policy Input| B[Local Governance Simulator]
+    B -->|Send Event| C[Flask Governance Daemon]
+    C -->|Evaluate| D[Policy Engine]
+    D -->|Decision| E[Action Execution Stub]
+    E -->|Response| F[Smoke Tests / Simulator Output]
+    C -->|Structured Logs| G[Console / Future Cloud Logging]
