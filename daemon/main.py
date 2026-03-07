@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Drake Daniel Peters
+# Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0)
+#
+# This file is part of the GCP AI Governor project.
+# See the LICENSE file for full license text.
 from flask import Flask, request, jsonify
 from policies.policy_engine import evaluate_event
 from tools.actions import execute_action

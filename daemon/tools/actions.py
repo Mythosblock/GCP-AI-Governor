@@ -1,3 +1,8 @@
+# Copyright (c) 2026 Drake Daniel Peters
+# Licensed under the GNU Affero General Public License v3.0 (AGPL-3.0)
+#
+# This file is part of the GCP AI Governor project.
+# See the LICENSE file for full license text.
 def execute_action(decision, event):
     if decision == "revoke":
         print("Simulated remediation: revoking role")
