@@ -19,7 +19,7 @@ from google.cloud import logging as cloud_logging
 import vertexai
 from vertexai.generative_models import GenerativeModel
 
-from app.decision_record import (
+from decision_record import (
     ActionResultContext,
     DecisionRecord,
     DeterministicPolicyContext,
