@@ -1,0 +1,3 @@
+[submodule "tools/ens"]
+	path = tools/ens
+	url = https://github.com/Mythosblock/Encrypted-Network-Stack-ENS-.git
