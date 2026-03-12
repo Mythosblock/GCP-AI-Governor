@@ -6,19 +6,29 @@ from __future__ import annotations
 import json
 import logging
 import os
+import threading
 import time
 import uuid
-from typing import Any, Dict, Tuple
-import threading
+from typing import Any, Dict, Optional, Tuple
 
 import functions_framework
+from cloudevents.http import CloudEvent
+from confluent_kafka import Consumer
 from flask import Request, jsonify
-
+from google.cloud import logging as cloud_logging
 import vertexai
 from vertexai.generative_models import GenerativeModel
-from google.cloud import logging as cloud_logging
-from confluent_kafka import Consumer
-from app.decision_record import DecisionRecord, EventContext, ResourceContext, DeterministicPolicyContext, VertexAdvisoryContext, KafkaContext, ActionResultContext
+
+from app.decision_record import (
+    ActionResultContext,
+    DecisionRecord,
+    DeterministicPolicyContext,
+    EventContext,
+    KafkaContext,
+    ResourceContext,
+    RuntimeContext,
+    VertexAdvisoryContext,
+)
 
 # ============================================================
 # Configuration
@@ -32,10 +42,17 @@ LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").strip().upper()
 SERVICE_NAME = os.getenv("K_SERVICE", "daemonic-codex-ai-governor").strip()
 MAX_INPUT_BYTES = int(os.getenv("MAX_INPUT_BYTES", "65536"))
 ENABLE_VERTEX_REASONING = os.getenv("ENABLE_VERTEX_REASONING", "true").strip().lower() == "true"
+
 KAFKA_BOOTSTRAP_SERVERS = os.getenv("KAFKA_BOOTSTRAP_SERVERS", "").strip()
-KAFKA_SECURITY_PROTOCOL = "SASL_SSL"
-KAFKA_SASL_MECHANISM = "OAUTHBEARER"
-GOVERNANCE_TOPIC = "governance.audit.v1"
+KAFKA_SECURITY_PROTOCOL = os.getenv("KAFKA_SECURITY_PROTOCOL", "SASL_SSL").strip()
+KAFKA_SASL_MECHANISM = os.getenv("KAFKA_SASL_MECHANISM", "OAUTHBEARER").strip()
+GOVERNANCE_TOPIC = os.getenv("GOVERNANCE_TOPIC", "governance.audit.v1").strip()
+
+HIGH_RISK_ROLES = {
+    "roles/owner",
+    "roles/editor",
+    "roles/iam.serviceAccountAdmin",
+}
 
 # ============================================================
 # Logging
@@ -54,430 +71,421 @@ except Exception as exc:
 def structured_log(entry: Dict[str, Any], severity: str = "INFO") -> None:
     payload = {
         "service": SERVICE_NAME,
-        "severity": severity,
+        "severity": severity.upper(),
         "timestamp": int(time.time()),
         **entry,
     }
-    logger.log(getattr(logging, severity.upper(), logging.INFO), json.dumps(payload, sort_keys=True))
-
-
-# ============================================================
-# Kafka Consumer Thread
-# ============================================================
-
-def _token_provider():
-    from google.auth.transport.requests import Request
-    import google.auth
-
-    credentials, _ = google.auth.default(
-        scopes=["https://www.googleapis.com/auth/cloud-platform"]
+    logger.log(
+        getattr(logging, severity.upper(), logging.INFO),
+        json.dumps(payload, sort_keys=True, default=str),
     )
-    credentials.refresh(Request())
-    return credentials.token
 
 
-def start_consumer_loop():
-    def _loop():
-        consumer = Consumer(
+# ============================================================
+# Kafka bootstrap / future event spine
+# ============================================================
+
+_consumer_started = False
+_consumer_lock = threading.Lock()
+
+
+def _token_provider(_: Optional[str] = None) -> Optional[str]:
+    """
+    Placeholder for future Kafka OAUTHBEARER flow.
+    Current MVP does not use Kafka auth tokens.
+    """
+    return None
+
+
+def start_consumer_loop() -> None:
+    global _consumer_started
+
+    with _consumer_lock:
+        if _consumer_started:
+            return
+        _consumer_started = True
+
+    if not KAFKA_BOOTSTRAP_SERVERS:
+        structured_log(
+            {
+                "type": "kafka_consumer_skipped",
+                "reason": "No bootstrap servers configured",
+            },
+            severity="WARNING",
+        )
+        return
+
+    try:
+        Consumer(
             {
                 "bootstrap.servers": KAFKA_BOOTSTRAP_SERVERS,
                 "security.protocol": KAFKA_SECURITY_PROTOCOL,
                 "sasl.mechanism": KAFKA_SASL_MECHANISM,
-                "sasl.oauthbearer.token": _token_provider(),
-                "group.id": "ai-governor-consumer",
-                "auto.offset.reset": "earliest",
+                "group.id": f"{SERVICE_NAME}-consumer",
+                "auto.offset.reset": "latest",
             }
         )
-        consumer.subscribe([GOVERNANCE_TOPIC])
-
-        while True:
-            msg = consumer.poll(1.0)
-            if msg is None:
-                continue
-            if msg.error():
-                structured_log(
-                    {"type": "kafka_poll_error", "error": str(msg.error())},
-                    severity="ERROR",
-                )
-                continue
-
-            try:
-                payload = json.loads(msg.value().decode("utf-8"))
-                evaluation = evaluate_event(payload)
-                action_result = execute_action(payload, evaluation)
-                structured_log(
-                    {
-                        "type": "kafka_event_processed",
-                        "payload": payload,
-                        "evaluation": evaluation,
-                        "action": action_result,
-                    }
-                )
-            except Exception as exc:
-                structured_log(
-                    {"type": "kafka_event_processing_error", "error": str(exc)},
-                    severity="ERROR",
-                )
-
-    if KAFKA_BOOTSTRAP_SERVERS:
-        t = threading.Thread(target=_loop, daemon=True)
-        t.start()
-        structured_log({"type": "kafka_consumer_started"})
-    else:
         structured_log(
-            {"type": "kafka_consumer_skipped", "reason": "No bootstrap servers configured"},
+            {
+                "type": "kafka_consumer_initialized",
+                "topic": GOVERNANCE_TOPIC,
+            },
+            severity="INFO",
+        )
+    except Exception as exc:
+        structured_log(
+            {
+                "type": "kafka_consumer_failed",
+                "error": str(exc),
+            },
             severity="WARNING",
         )
 
 
+start_consumer_loop()
+
 # ============================================================
-# Vertex AI initialization
+# Vertex reasoning
 # ============================================================
 
-_model: GenerativeModel | None = None
-_vertex_init_attempted = False
+_vertex_model: Optional[GenerativeModel] = None
+_vertex_lock = threading.Lock()
 
 
 def get_model() -> GenerativeModel:
-    global _model, _vertex_init_attempted
-
-    if _model is not None:
-        return _model
+    global _vertex_model
 
     if not PROJECT_ID:
         raise RuntimeError("GOOGLE_CLOUD_PROJECT is required for Vertex AI initialization")
 
-    if not _vertex_init_attempted:
-        vertexai.init(project=PROJECT_ID, location=REGION)
-        _vertex_init_attempted = True
+    with _vertex_lock:
+        if _vertex_model is None:
+            vertexai.init(project=PROJECT_ID, location=REGION)
+            _vertex_model = GenerativeModel(MODEL_NAME)
 
-    _model = GenerativeModel(MODEL_NAME)
-    return _model
-
-
-# ============================================================
-# Governance policy
-# ============================================================
-
-def deterministic_policy(event: Dict[str, Any]) -> Tuple[str, str]:
-    event_type = str(event.get("event_type", "")).strip()
-    role = str(event.get("roleGranted", "")).strip()
-
-    if role == "roles/owner":
-        return "revoke", "owner_role_grant_detected"
-
-    if role in {
-        "roles/editor",
-        "roles/iam.serviceAccountAdmin",
-        "roles/resourcemanager.projectIamAdmin",
-    }:
-        return "revoke", "high_privilege_role_grant_detected"
-
-    if role in {"roles/viewer", "roles/browser"}:
-        return "allow", "read_only_role_detected"
-
-    if event_type in {"heartbeat", "healthcheck", "noop"}:
-        return "ignore", "non_actionable_event"
-
-    return "allow", "default_allow"
+    return _vertex_model
 
 
-def build_reasoning_prompt(
-    event: Dict[str, Any],
-    deterministic_decision: str,
-    deterministic_reason: str,
-) -> str:
-    return f"""
-You are an AI cloud governance analyst operating in DRY-RUN-FIRST mode.
-
-Your task:
-1. Review the infrastructure event.
-2. Confirm whether the deterministic governance policy is reasonable.
-3. Return strict JSON only.
-
-Rules:
-- Never recommend live mutation directly.
-- Treat all actions as advisory unless LIVE_MODE is explicitly enabled.
-- Keep the output concise and machine-readable.
-
-Event:
-{json.dumps(event, indent=2, sort_keys=True)}
-
-Deterministic policy result:
-{json.dumps({"decision": deterministic_decision, "reason": deterministic_reason}, indent=2)}
-
-Return JSON with exactly these keys:
-{{
-  "decision": "allow|revoke|ignore",
-  "reason": "short_machine_reason",
-  "risk_level": "low|medium|high",
-  "summary": "short human-readable explanation"
-}}
-""".strip()
+def build_reasoning_prompt(event: Dict[str, Any]) -> str:
+    return (
+        "You are a cloud governance advisor. "
+        "Given this event, summarize risk and recommend an action in one short paragraph.\n\n"
+        f"Event:\n{json.dumps(event, indent=2, sort_keys=True, default=str)}"
+    )
 
 
-def vertex_reasoning(
-    event: Dict[str, Any],
-    deterministic_decision: str,
-    deterministic_reason: str,
-) -> Dict[str, Any]:
-    prompt = build_reasoning_prompt(event, deterministic_decision, deterministic_reason)
-    model = get_model()
-    response = model.generate_content(prompt)
-
-    text = getattr(response, "text", "") or ""
-    cleaned = text.strip()
-
-    try:
-        return json.loads(cleaned)
-    except Exception:
-        return {
-            "decision": deterministic_decision,
-            "reason": "vertex_response_non_json_fallback",
-            "risk_level": "medium" if deterministic_decision == "revoke" else "low",
-            "summary": cleaned[:1000],
-        }
-
-
-def evaluate_event(event: Dict[str, Any]) -> Dict[str, Any]:
-    deterministic_decision, deterministic_reason = deterministic_policy(event)
-
-    result: Dict[str, Any] = {
-        "decision": deterministic_decision,
-        "reason": deterministic_reason,
-        "risk_level": "high" if deterministic_decision == "revoke" else "low",
-        "summary": "Deterministic policy evaluation completed.",
-        "evaluation_mode": "deterministic_only",
-    }
-
+def vertex_reasoning(event: Dict[str, Any]) -> Dict[str, Any]:
     if not ENABLE_VERTEX_REASONING:
-        return result
+        return {
+            "enabled": False,
+            "status": "skipped",
+            "model": MODEL_NAME,
+            "latency_ms": 0,
+            "summary": None,
+            "error": None,
+        }
+
+    started = time.time()
 
     try:
-        ai_result = vertex_reasoning(event, deterministic_decision, deterministic_reason)
-        result.update(
-            {
-                "decision": ai_result.get("decision", deterministic_decision),
-                "reason": ai_result.get("reason", deterministic_reason),
-                "risk_level": ai_result.get("risk_level", result["risk_level"]),
-                "summary": ai_result.get("summary", result["summary"]),
-                "evaluation_mode": "deterministic_plus_vertex",
-            }
-        )
+        model = get_model()
+        prompt = build_reasoning_prompt(event)
+        response = model.generate_content(prompt)
+        summary = getattr(response, "text", None)
+
+        return {
+            "enabled": True,
+            "status": "success",
+            "model": MODEL_NAME,
+            "latency_ms": int((time.time() - started) * 1000),
+            "summary": summary,
+            "error": None,
+        }
     except Exception as exc:
-        structured_log(
-            {
-                "type": "vertex_reasoning_failure",
-                "error": str(exc),
-                "fallback_decision": deterministic_decision,
-            },
-            severity="WARNING",
-        )
-
-    return result
-
-
-def execute_action(event: Dict[str, Any], evaluation: Dict[str, Any]) -> Dict[str, Any]:
-    decision = evaluation["decision"]
-
-    if decision == "revoke":
         return {
-            "status": "EXECUTED" if LIVE_MODE else "DRY_RUN_SUCCESS",
-            "action": "revoke_access",
-            "principal": event.get("principal", "unknown"),
-            "role": event.get("roleGranted", "unknown"),
-            "resource": event.get("resource", "unknown"),
-            "live_mode": LIVE_MODE,
+            "enabled": True,
+            "status": "error",
+            "model": MODEL_NAME,
+            "latency_ms": int((time.time() - started) * 1000),
+            "summary": None,
+            "error": str(exc),
         }
-
-    if decision == "ignore":
-        return {
-            "status": "IGNORED",
-            "action": "none",
-            "live_mode": LIVE_MODE,
-        }
-
-    return {
-        "status": "ALLOWED",
-        "action": "none",
-        "live_mode": LIVE_MODE,
-    }
 
 
 # ============================================================
-# Request helpers
+# Event normalization + policy
 # ============================================================
 
-def parse_request_payload(request: Request) -> Dict[str, Any]:
-    raw = request.get_data(cache=False, as_text=False) or b""
+def parse_request_payload(event: CloudEvent) -> Dict[str, Any]:
+    data = getattr(event, "data", None)
 
-    if len(raw) > MAX_INPUT_BYTES:
-        raise ValueError(f"request payload exceeds MAX_INPUT_BYTES={MAX_INPUT_BYTES}")
-
-    if not raw:
+    if data is None:
         return {}
 
-    try:
-        return json.loads(raw.decode("utf-8"))
-    except Exception as exc:
-        raise ValueError(f"invalid_json_payload: {exc}") from exc
+    if isinstance(data, dict):
+        return data
+
+    if isinstance(data, (str, bytes)):
+        try:
+            if isinstance(data, bytes):
+                data = data.decode("utf-8", errors="replace")
+            return json.loads(data)
+        except Exception:
+            return {"raw_payload": data}
+
+    return {"raw_payload": data}
 
 
-def normalize_event(payload: Dict[str, Any]) -> Dict[str, Any]:
-    proto = payload.get("protoPayload", {})
+def _extract_role_from_audit_payload(payload: Dict[str, Any]) -> str:
+    proto = payload.get("protoPayload", {}) or {}
+    request = proto.get("request", {}) or {}
 
-    if proto:
-        return {
-            "event_id": payload.get("event_id", str(uuid.uuid4())),
-            "timestamp": payload.get("timestamp", int(time.time())),
-            "event_type": proto.get("methodName", "unknown"),
-            "principal": proto.get("authenticationInfo", {}).get("principalEmail", "unknown"),
-            "resource": proto.get("resourceName", "unknown"),
-            "roleGranted": payload.get("roleGranted", ""),
-            "raw_payload": payload,
-        }
+    policy = request.get("policy", {}) or {}
+    bindings = policy.get("bindings", []) or []
+
+    for binding in bindings:
+        role = binding.get("role")
+        if role:
+            return role
+
+    role_granted = payload.get("roleGranted", "")
+    if role_granted:
+        return role_granted
+
+    return ""
+
+
+def normalize_event(payload: Dict[str, Any], event: CloudEvent) -> Dict[str, Any]:
+    attrs = getattr(event, "_attributes", {}) or {}
+    proto = payload.get("protoPayload", {}) or {}
+
+    principal = (
+        proto.get("authenticationInfo", {}).get("principalEmail")
+        or payload.get("principal")
+        or "unknown"
+    )
+    resource = proto.get("resourceName") or payload.get("resource") or "unknown"
+    method_name = proto.get("methodName") or payload.get("event_type") or "unknown"
+    role_granted = _extract_role_from_audit_payload(payload)
 
     return {
-        "event_id": payload.get("event_id", str(uuid.uuid4())),
-        "timestamp": payload.get("timestamp", int(time.time())),
-        "event_type": payload.get("event_type", "unknown"),
-        "principal": payload.get("principal", "unknown"),
-        "resource": payload.get("resource", "unknown"),
-        "roleGranted": payload.get("roleGranted", ""),
+        "event_id": attrs.get("id", payload.get("event_id", str(uuid.uuid4()))),
+        "timestamp": attrs.get("time", payload.get("timestamp", int(time.time()))),
+        "event_type": attrs.get("type", "unknown"),
+        "source": attrs.get("source", "unknown"),
+        "subject": attrs.get("subject"),
+        "method_name": method_name,
+        "service_name": proto.get("serviceName"),
+        "principal": principal,
+        "resource": resource,
+        "roleGranted": role_granted,
         "raw_payload": payload,
     }
 
 
-# ============================================================
-# Functions Framework entrypoint
-# ============================================================
+def deterministic_policy(event: Dict[str, Any]) -> Dict[str, Any]:
+    role = (event.get("roleGranted") or "").strip()
 
-@functions_framework.http
-def governor(request:
-
-    _decision_record = DecisionRecord(
-        live_mode=LIVE_MODE,
-        event=EventContext(),
-        resource=ResourceContext(
-            project_id=os.environ.get("GOOGLE_CLOUD_PROJECT", "unknown"),
-            location=os.environ.get("REGION", "us-central1"),
-        ),
-        deterministic_policy=DeterministicPolicyContext(),
-        vertex_advisory=VertexAdvisoryContext(
-            enabled=os.environ.get("ENABLE_VERTEX_REASONING", "false").lower() == "true",
-            model=os.environ.get("VERTEX_MODEL_ID", "gemini-2.5-flash"),
-        ),
-        kafka=KafkaContext(
-            enabled=bool(os.environ.get("KAFKA_BOOTSTRAP_SERVERS")),
-            status="enabled" if os.environ.get("KAFKA_BOOTSTRAP_SERVERS") else "skipped",
-            topic=os.environ.get("KAFKA_TOPIC"),
-            error=None if os.environ.get("KAFKA_BOOTSTRAP_SERVERS") else "No bootstrap servers configured",
-        ),
-        action_result=ActionResultContext(
-            executed=False,
-            action="none",
-            status="UNKNOWN",
-            dry_run=(not LIVE_MODE),
-        ),
-    )
- Request):
-    request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
-
-    if request.method == "GET" and request.path in {"/", "/health"}:
-        return jsonify(
-            {
-                "status": "ok",
-                "service": SERVICE_NAME,
-                "live_mode": LIVE_MODE,
-                "vertex_reasoning_enabled": ENABLE_VERTEX_REASONING,
-                "model": MODEL_NAME,
-                "region": REGION,
-            }
-        ), 200
-
-    if request.method != "POST":
-        return jsonify(
-            {
-                "error": "method_not_allowed",
-                "allowed_methods": ["GET", "POST"],
-                "request_id": request_id,
-            }
-        ), 405
-
-    try:
-        payload = parse_request_payload(request)
-        event = normalize_event(payload)
-
-        structured_log(
-            {
-                "type": "event_received",
-                "request_id": request_id,
-                "event_id": event["event_id"],
-                "principal": event["principal"],
-                "resource": event["resource"],
-                "event_type": event["event_type"],
-                "roleGranted": event["roleGranted"],
-                "live_mode": LIVE_MODE,
-            }
-        )
-
-        evaluation = evaluate_event(event)
-        action_result = execute_action(event, evaluation)
-
-        response = {
-            "request_id": request_id,
-            "event_id": event["event_id"],
-            "evaluation": evaluation,
-            "action_result": action_result,
+    if role in HIGH_RISK_ROLES:
+        return {
+            "decision": "revoke",
+            "reason": "high_risk_role_binding",
+            "risk_level": "high",
+            "evaluation_mode": "deterministic_only",
+            "summary": f"High-risk role detected: {role}",
+            "rule_id": "high_risk_role_binding",
+            "rules_fired": ["high_risk_role_binding"],
         }
 
+    return {
+        "decision": "allow",
+        "reason": "default_allow",
+        "risk_level": "low",
+        "evaluation_mode": "deterministic_only",
+        "summary": "Deterministic policy evaluation completed.",
+        "rule_id": "default_allow",
+        "rules_fired": ["default_allow"],
+    }
+
+
+def evaluate_event(event: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
+    policy = deterministic_policy(event)
+    advisory = vertex_reasoning(event)
+
+    if advisory.get("status") == "error":
         structured_log(
             {
-                "type": "governance_decision",
-                "request_id": request_id,
-                "event_id": event["event_id"],
-                "decision": evaluation["decision"],
-                "reason": evaluation["reason"],
-                "risk_level": evaluation["risk_level"],
-                "action_status": action_result["status"],
-                "live_mode": LIVE_MODE,
-            }
-        )
-
-        return jsonify(response), 200
-
-    except ValueError as exc:
-        structured_log(
-            {
-                "type": "bad_request",
-                "request_id": request_id,
-                "error": str(exc),
+                "type": "vertex_reasoning_failure",
+                "error": advisory.get("error"),
+                "fallback_decision": policy.get("decision"),
             },
             severity="WARNING",
         )
-        return jsonify(
-            {
-                "error": "bad_request",
-                "message": str(exc),
-                "request_id": request_id,
+
+    return policy, advisory
+
+
+def execute_action(event: Dict[str, Any], evaluation: Dict[str, Any]) -> Dict[str, Any]:
+    decision = evaluation.get("decision", "allow")
+
+    if not LIVE_MODE:
+        if decision == "revoke":
+            return {
+                "executed": False,
+                "action": "revoke_access",
+                "status": "DRY_RUN_SUCCESS",
+                "dry_run": True,
             }
-        ), 400
 
-    except Exception as exc:
-        structured_log(
-            {
-                "type": "internal_error",
-                "request_id": request_id,
-                "error": str(exc),
-            },
-            severity="ERROR",
-        )
-        return jsonify(
-            {
-                "error": "internal_error",
-                "request_id": request_id,
-            }
-        ), 500
+        return {
+            "executed": False,
+            "action": "none",
+            "status": "ALLOWED",
+            "dry_run": True,
+        }
+
+    if decision == "revoke":
+        return {
+            "executed": True,
+            "action": "revoke_access",
+            "status": "EXECUTED",
+            "dry_run": False,
+        }
+
+    return {
+        "executed": False,
+        "action": "none",
+        "status": "ALLOWED",
+        "dry_run": False,
+    }
 
 
-start_consumer_loop()
+# ============================================================
+# Functions Framework entrypoints
+# ============================================================
+
+@functions_framework.http
+def health(request: Request):
+    return jsonify(
+        {
+            "status": "ok",
+            "service": SERVICE_NAME,
+            "model": MODEL_NAME,
+            "region": REGION,
+            "live_mode": LIVE_MODE,
+            "vertex_reasoning_enabled": ENABLE_VERTEX_REASONING,
+        }
+    )
+
+
+@functions_framework.cloud_event
+def governor(event: CloudEvent):
+    request_id = str(uuid.uuid4())
+
+    payload = parse_request_payload(event)
+    normalized = normalize_event(payload, event)
+
+    structured_log(
+        {
+            "type": "event_received",
+            "event_id": normalized["event_id"],
+            "request_id": request_id,
+            "event_type": normalized["method_name"],
+            "principal": normalized["principal"],
+            "resource": normalized["resource"],
+            "roleGranted": normalized["roleGranted"],
+            "live_mode": LIVE_MODE,
+        },
+        severity="INFO",
+    )
+
+    evaluation, advisory = evaluate_event(normalized)
+    action_result = execute_action(normalized, evaluation)
+
+    decision_record = DecisionRecord(
+        live_mode=LIVE_MODE,
+        event_id=normalized["event_id"],
+        request_id=request_id,
+        evaluation_mode=evaluation.get("evaluation_mode", "deterministic_only"),
+        status=action_result.get("status", "UNKNOWN"),
+        decision=evaluation.get("decision", "unknown"),
+        reason=evaluation.get("reason", "unspecified"),
+        risk_level=evaluation.get("risk_level", "unknown"),
+        summary=evaluation.get("summary", "Decision recorded."),
+        event=EventContext(
+            source=normalized.get("source"),
+            type=normalized.get("event_type"),
+            subject=normalized.get("subject"),
+            time=str(normalized.get("timestamp")),
+            service_name=normalized.get("service_name"),
+            method_name=normalized.get("method_name"),
+            resource_name=normalized.get("resource"),
+            principal_email=normalized.get("principal"),
+        ),
+        resource=ResourceContext(
+            project_id=PROJECT_ID or "unknown",
+            location=REGION,
+            target_type="project",
+            target_name=normalized.get("resource"),
+        ),
+        deterministic_policy=DeterministicPolicyContext(
+            matched=True,
+            rule_id=evaluation.get("rule_id"),
+            rules_fired=evaluation.get("rules_fired", []),
+        ),
+        vertex_advisory=VertexAdvisoryContext(
+            enabled=bool(advisory.get("enabled", False)),
+            status=str(advisory.get("status", "skipped")),
+            model=advisory.get("model"),
+            latency_ms=int(advisory.get("latency_ms", 0) or 0),
+            summary=advisory.get("summary"),
+            error=advisory.get("error"),
+        ),
+        kafka=KafkaContext(
+            enabled=bool(KAFKA_BOOTSTRAP_SERVERS),
+            status="enabled" if KAFKA_BOOTSTRAP_SERVERS else "skipped",
+            topic=GOVERNANCE_TOPIC if KAFKA_BOOTSTRAP_SERVERS else None,
+            error=None if KAFKA_BOOTSTRAP_SERVERS else "No bootstrap servers configured",
+        ),
+        action_result=ActionResultContext(
+            executed=bool(action_result.get("executed", False)),
+            action=str(action_result.get("action", "none")),
+            status=str(action_result.get("status", "UNKNOWN")),
+            dry_run=bool(action_result.get("dry_run", not LIVE_MODE)),
+        ),
+        runtime=RuntimeContext(
+            region=REGION,
+            revision=os.getenv("K_REVISION"),
+            instance_id=os.getenv("K_INSTANCE"),
+        ),
+    )
+
+    structured_log(decision_record.to_dict(), severity="INFO")
+
+    structured_log(
+        {
+            "type": "governance_decision",
+            "event_id": normalized["event_id"],
+            "request_id": request_id,
+            "decision": evaluation.get("decision"),
+            "reason": evaluation.get("reason"),
+            "risk_level": evaluation.get("risk_level"),
+            "action_status": action_result.get("status"),
+            "live_mode": LIVE_MODE,
+        },
+        severity="INFO",
+    )
+
+    return {
+        "status": action_result.get("status", "UNKNOWN"),
+        "event_id": normalized["event_id"],
+        "request_id": request_id,
+        "evaluation": {
+            "decision": evaluation.get("decision"),
+            "evaluation_mode": evaluation.get("evaluation_mode"),
+            "reason": evaluation.get("reason"),
+            "risk_level": evaluation.get("risk_level"),
+            "summary": evaluation.get("summary"),
+        },
+        "action_result": action_result,
+    }
