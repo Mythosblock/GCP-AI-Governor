@@ -18,6 +18,7 @@ import vertexai
 from vertexai.generative_models import GenerativeModel
 from google.cloud import logging as cloud_logging
 from confluent_kafka import Consumer
+from app.decision_record import DecisionRecord, EventContext, ResourceContext, DeterministicPolicyContext, VertexAdvisoryContext, KafkaContext, ActionResultContext
 
 # ============================================================
 # Configuration
@@ -352,7 +353,34 @@ def normalize_event(payload: Dict[str, Any]) -> Dict[str, Any]:
 # ============================================================
 
 @functions_framework.http
-def governor(request: Request):
+def governor(request:
+
+    _decision_record = DecisionRecord(
+        live_mode=LIVE_MODE,
+        event=EventContext(),
+        resource=ResourceContext(
+            project_id=os.environ.get("GOOGLE_CLOUD_PROJECT", "unknown"),
+            location=os.environ.get("REGION", "us-central1"),
+        ),
+        deterministic_policy=DeterministicPolicyContext(),
+        vertex_advisory=VertexAdvisoryContext(
+            enabled=os.environ.get("ENABLE_VERTEX_REASONING", "false").lower() == "true",
+            model=os.environ.get("VERTEX_MODEL_ID", "gemini-2.5-flash"),
+        ),
+        kafka=KafkaContext(
+            enabled=bool(os.environ.get("KAFKA_BOOTSTRAP_SERVERS")),
+            status="enabled" if os.environ.get("KAFKA_BOOTSTRAP_SERVERS") else "skipped",
+            topic=os.environ.get("KAFKA_TOPIC"),
+            error=None if os.environ.get("KAFKA_BOOTSTRAP_SERVERS") else "No bootstrap servers configured",
+        ),
+        action_result=ActionResultContext(
+            executed=False,
+            action="none",
+            status="UNKNOWN",
+            dry_run=(not LIVE_MODE),
+        ),
+    )
+ Request):
     request_id = request.headers.get("X-Request-Id", str(uuid.uuid4()))
 
     if request.method == "GET" and request.path in {"/", "/health"}:
