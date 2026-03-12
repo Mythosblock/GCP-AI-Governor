@@ -1,0 +1,15 @@
+
+name: Eternum Net Guard
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    branches:
+      - main
+  workflow_dispatch:
+
+jobs:
+  net-guard:
+    uses: Quantum-Cipher/eternum-net-guard/.github/workflows/reusable-net-guard.yml@main
